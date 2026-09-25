@@ -1198,5 +1198,138 @@ class TranscriptRetimeApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class QaPairsApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 500, "text": "你觉得", "speaker": "A"},
+        {"start_ms": 500, "end_ms": 1000, "text": "行吗？", "speaker": "A"},
+        {"start_ms": 1000, "end_ms": 1500, "text": "我觉得", "speaker": "B"},
+        {"start_ms": 1500, "end_ms": 2000, "text": "可以", "speaker": "B"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "max_gap_ms": 1000}
+        payload.update(overrides)
+        return self.client.post("/qa-pairs", json=payload)
+
+    def test_basic_qa_pairs(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.json(),
+            {
+                "pairs": [
+                    {
+                        "index": 0,
+                        "question": {
+                            "start_word": 0,
+                            "end_word": 1,
+                            "start_ms": 0,
+                            "end_ms": 1000,
+                            "speaker": "A",
+                            "text": "你觉得行吗？",
+                        },
+                        "answer": {
+                            "start_word": 2,
+                            "end_word": 3,
+                            "start_ms": 1000,
+                            "end_ms": 2000,
+                            "speaker": "B",
+                            "text": "我觉得可以",
+                        },
+                    }
+                ],
+                "unpaired_question_start_words": [],
+            },
+        )
+
+    def test_gap_filters_answer(self):
+        # 回答首词 start=1000、问题末词 end=1000，gap=0；上限 -1 非法、0 合法
+        resp = self.post(max_gap_ms=-1)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        resp = self.post(max_gap_ms=0)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["pairs"]), 1)
+
+    def test_no_candidate_returns_empty_pairs_with_unpaired(self):
+        # 只有提问、没有其他说话人回答
+        words = [
+            {"start_ms": 0, "end_ms": 500, "text": "为什么？", "speaker": "A"},
+            {"start_ms": 500, "end_ms": 1000, "text": "嗯", "speaker": "A"},
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["pairs"], [])
+        self.assertEqual(data["unpaired_question_start_words"], [])
+        # 相邻同说话人合并成一轮，整轮不以？结尾，故也没有提问
+
+        # 提问落单：其它说话人回答在窗口之外
+        words2 = [
+            {"start_ms": 0, "end_ms": 500, "text": "在吗？", "speaker": "A"},
+            {"start_ms": 900, "end_ms": 1000, "text": "在", "speaker": "B"},  # gap=400
+        ]
+        resp = self.post(words=words2, max_gap_ms=399)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["pairs"], [])
+        self.assertEqual(data["unpaired_question_start_words"], [0])
+
+    def test_no_questions_returns_empty(self):
+        words = [
+            {"start_ms": 0, "end_ms": 500, "text": "今天天气", "speaker": "A"},
+            {"start_ms": 500, "end_ms": 1000, "text": "不错", "speaker": "B"},
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.json(), {"pairs": [], "unpaired_question_start_words": []}
+        )
+
+    def test_trailing_whitespace_question_detection(self):
+        words = [
+            {"start_ms": 0, "end_ms": 500, "text": "真的吗? ", "speaker": "A"},
+            {"start_ms": 500, "end_ms": 1000, "text": "真的", "speaker": "B"},
+        ]
+        resp = self.post(words=words, max_gap_ms=0)
+        self.assertEqual(resp.status_code, 200)
+        pairs = resp.json()["pairs"]
+        self.assertEqual(len(pairs), 1)
+        # 返回文本保留尾部空白原样
+        self.assertEqual(pairs[0]["question"]["text"], "真的吗? ")
+
+    def test_words_over_300_rejected(self):
+        big = [
+            {"start_ms": i * 10, "end_ms": i * 10 + 9, "text": "字", "speaker": "A"}
+            for i in range(301)
+        ]
+        resp = self.post(words=big)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # 300 词恰好在上限内
+        resp = self.post(words=big[:300], max_gap_ms=0)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_max_gap_ms_required_and_non_negative(self):
+        resp = self.client.post("/qa-pairs", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

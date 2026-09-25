@@ -3,7 +3,7 @@ POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
 遮罩预览、POST /trailer-plan 预告片片段组合、POST /playback-plan 播放变速
 规划、POST /crosstalk-report 叠话统计报告、POST /transcript-retime 修订稿
-重新对齐逐词时间服务。"""
+重新对齐逐词时间、POST /qa-pairs 访谈问答可回听索引服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,6 +15,7 @@ from .crosstalk_report import build_crosstalk_report
 from .duplicate_passages import find_duplicate_passages
 from .errors import DomainError
 from .playback_plan import plan_playback
+from .qa_pairs import build_qa_pairs
 from .redact_preview import redact_preview
 from .schemas import (
     AdBreakRequest,
@@ -27,6 +28,8 @@ from .schemas import (
     DuplicatePassagesResponse,
     PlaybackPlanRequest,
     PlaybackPlanResponse,
+    QaPairsRequest,
+    QaPairsResponse,
     RedactPreviewRequest,
     RedactPreviewResponse,
     SegmentRequest,
@@ -57,8 +60,11 @@ app = FastAPI(
     "对允许乱序与交叠的词序列统计各说话人发声覆盖、"
     "至少两人同时发声的叠话区间与各说话人对的总重叠毫秒数，"
     "并按 (text, speaker) 的最长保序匹配把修订稿锚定到原稿词时间轴、"
-    "为未匹配修订词在相邻锚点间隔内均分时间。",
-    version="1.9.0",
+    "为未匹配修订词在相邻锚点间隔内均分时间，"
+    "以及把相邻同一说话人的词合并为发言轮次、"
+    "在其他说话人且间隔受限的回答中为每个提问保序一对一配对、"
+    "生成可回听的问答索引。",
+    version="1.10.0",
 )
 
 
@@ -91,7 +97,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "budget_ms 与 1～3 个非空 required_speakers；/playback-plan 另需"
         "非负整数 max_duration_ms；/crosstalk-report 的 words 至多 2000 个；"
         "/transcript-retime 另需非空 revisions（每项含非空 text/speaker），"
-        "words 与 revisions 各不超过 300 个",
+        "words 与 revisions 各不超过 300 个；/qa-pairs 另需非负整数 "
+        "max_gap_ms，words 不超过 300 个",
         {"errors": exc.errors()},
     )
 
@@ -208,3 +215,12 @@ async def create_crosstalk_report(request: CrosstalkReportRequest):
 async def create_transcript_retime(request: TranscriptRetimeRequest):
     words, matched_count = retime_transcript(request.words, request.revisions)
     return TranscriptRetimeResponse(words=words, matched_count=matched_count)
+
+
+@app.post("/qa-pairs", response_model=QaPairsResponse)
+async def create_qa_pairs(request: QaPairsRequest):
+    pairs, unpaired = build_qa_pairs(request.words, request.max_gap_ms)
+    return QaPairsResponse(
+        pairs=pairs,
+        unpaired_question_start_words=unpaired,
+    )

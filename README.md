@@ -13,7 +13,9 @@
 对允许乱序与交叠的词序列统计各说话人发声覆盖、至少两人同时发声的
 叠话区间与各说话人对的总重叠毫秒数，以及**修订稿重对齐逐词时间**接口，
 按 `(text, speaker)` 在原稿与修订稿间求最长保序匹配，命中词沿用原时间、
-未命中修订词在相邻锚点间隔内均分时间。
+未命中修订词在相邻锚点间隔内均分时间，以及**访谈问答索引**接口，把相邻
+同一说话人的词合并为发言轮次，识别以问号结尾的提问，在其他说话人、始于
+问题结束后且间隔受限的回答中做保序一对一配对，生成可回听的问答索引。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -35,6 +37,7 @@ docker compose up --build
 - 播放变速规划接口：`POST http://localhost:8000/playback-plan`
 - 叠话统计报告接口：`POST http://localhost:8000/crosstalk-report`
 - 修订稿重对齐逐词时间接口：`POST http://localhost:8000/transcript-retime`
+- 访谈问答索引接口：`POST http://localhost:8000/qa-pairs`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -1000,13 +1003,121 @@ curl -s http://localhost:8000/transcript-retime \
 }
 ```
 
+## 访谈问答索引：`POST /qa-pairs`
+
+为访谈转写生成**可回听的问答索引**：先把词序列按**相邻同一说话人**合并成
+发言轮次，识别其中的**提问**，再从满足说话人与时间间隔条件的**回答**轮次中
+做**保序一对一配对**。`words` 字段与 `/segments` 相同，但至多 **300** 个词，
+并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/qa-pairs`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "你觉得", "speaker": "A"},
+    {"start_ms": 500,  "end_ms": 1000, "text": "行吗？", "speaker": "A"},
+    {"start_ms": 1000, "end_ms": 1500, "text": "我觉得", "speaker": "B"},
+    {"start_ms": 1500, "end_ms": 2000, "text": "可以",   "speaker": "B"}
+  ],
+  "max_gap_ms": 1000
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_gap_ms` | 非负整数 | 回答首词 `start_ms` 与问题末词 `end_ms` 的最大间隔（毫秒，含边界） |
+
+### 轮次合并与提问识别
+
+1. **发言轮次**：相邻且 `speaker` 相同的词合并为一轮（即说话人连续区间），
+   轮次文本为各词 `text` **原样拼接（不插空格）**；轮次起止时间取首词
+   `start_ms` 与末词 `end_ms`；
+2. **提问**：轮次文本**去掉尾部空白**（`str.rstrip`，覆盖空格/制表符/换行/
+   全角空格等 Unicode 空白）后，以全角 `？` 或半角 `?` 结尾者；其余轮次
+   （含去空白后为空者）均可作为**回答**候选。返回的轮次 `text` 始终保留
+   原始拼接结果（不去空白）。
+
+### 配对规则
+
+一条提问 `q` 与一条回答 `a` 构成候选对，当且仅当同时满足：
+
+1. **其他说话人**：`a.speaker != q.speaker`；
+2. **始于问题结束后**：`a.start_ms >= q.end_ms`（输入词互不重叠，端点相接
+   允许；该条件已蕴含二者在时间上不重叠）；
+3. **间隔不超过窗口**：`a.start_ms - q.end_ms <= max_gap_ms`（间隔非负，
+   故 `max_gap_ms = 0` 时仅端点相接可配）。
+
+在**全部候选**上求一个**保序一对一匹配**：每条提问至多配一条回答、每条回答
+至多配一条提问，配对双方按轮次顺序都严格递增。优化目标依次为：
+
+1. **配对数最多**；
+2. 配对数相同时，**Σ 回答文本字符数**（Unicode code point，按返回的原样
+   拼接文本计）**最大**；
+3. 仍相同时，取 `(问题首词序号, 回答首词序号)` **配对序列字典序最小**者——
+   逐对比较，先比问题首词序号，相同再比回答首词序号。
+
+### 响应示例（200）
+
+```json
+{
+  "pairs": [
+    {
+      "index": 0,
+      "question": {
+        "start_word": 0, "end_word": 1,
+        "start_ms": 0, "end_ms": 1000,
+        "speaker": "A", "text": "你觉得行吗？"
+      },
+      "answer": {
+        "start_word": 2, "end_word": 3,
+        "start_ms": 1000, "end_ms": 2000,
+        "speaker": "B", "text": "我觉得可以"
+      }
+    }
+  ],
+  "unpaired_question_start_words": []
+}
+```
+
+> `pairs` 按问题时间（首词序号）升序返回，`index` 为 0-based 序号；
+> `question` / `answer` 各自给出**词区间**（`start_word`/`end_word`，0-based、
+> 含端点）、**时间区间**（`start_ms`/`end_ms`，首词 `start_ms` 与末词
+> `end_ms`）、`speaker` 与原样拼接的 `text`。
+> `unpaired_question_start_words` 为**未配上回答的提问首词序号**（0-based、
+> 升序）。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/qa-pairs \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"你觉得","speaker":"A"},{"start_ms":500,"end_ms":1000,"text":"行吗？","speaker":"A"},{"start_ms":1000,"end_ms":1500,"text":"我觉得","speaker":"B"},{"start_ms":1500,"end_ms":2000,"text":"可以","speaker":"B"}],"max_gap_ms":1000}'
+```
+
+### 无候选 / 无提问
+
+没有任何候选对（如提问后无其他说话人、间隔都超过 `max_gap_ms`）时返回
+**200**，`pairs` 为空数组；所有提问首词序号进入
+`unpaired_question_start_words`。根本没有提问轮次时，两个字段均为空数组：
+
+```json
+{"pairs": [], "unpaired_question_start_words": [0]}
+```
+
+```json
+{"pairs": [], "unpaired_question_start_words": []}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负；`/transcript-retime` 的 `words`/`revisions` 为空或超过 300 个、修订项缺 `text`/`speaker` 或为空字符串） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负；`/transcript-retime` 的 `words`/`revisions` 为空或超过 300 个、修订项缺 `text`/`speaker` 或为空字符串；`/qa-pairs` 的 `words` 超过 300 个、`max_gap_ms` 缺失/为负/非整数） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms`（`/crosstalk-report` 中 `word_index` 为输入序） | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -1151,6 +1262,18 @@ E 为不同边界时刻数 ≤ 2n、M 为输出段数 ≤ E、k 为活跃说话�
 首词 `start_ms`、末词 `end_ms` 作虚拟锚点，无命中时整段均分全长；
 任一 run `span < c` 即返回 422 并给出该 run 的修订词闭区间。
 
+访谈问答索引（`qa_pairs.py`）为后向 DP + 贪心重建，
+**O(p·r) 时间/空间**（p、r 为提问与回答轮次数，p + r ≤ 词数 ≤ 300）。先把
+相邻同一说话人的词合并为轮次，按“去尾部空白后以 ？/? 结尾”划分提问与回答，
+再以（说话人不同、`0 <= 回答 start - 问题 end <= max_gap_ms`）建候选边；
+`dp[i][j]` 表示提问后缀 `[i,p)` 与回答后缀 `[j,r)` 上的最优值
+`(配对数, 回答字符总数)`（元组先比配对数），转移取“跳过提问 / 跳过回答 /
+取候选对 (i,j) 加对角后缀”三者最大，边界全为 `(0,0)`；重建时在当前子矩形内
+按问题序号升序、同问题按回答序号升序，取第一个满足“取此对 + 对角后缀最优”
+恰等于当前最优值的候选对——枚举顺序先问题后回答即取
+（问题首词序号, 回答首词序号）字典序最小的可行首对，归纳可得整条配对序列
+字典序最小；未入选的提问首词序号按升序作为未配对列表返回。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -1182,6 +1305,7 @@ app/
   playback_plan.py      # 播放变速规划（纯标准库，复用同一套输入校验）
   crosstalk_report.py   # 叠话统计报告（纯标准库，允许乱序与交叠，仅校验词内时间）
   transcript_retime.py  # 修订稿重对齐逐词时间（纯标准库，LCS 匹配 + 锚点间隔均分）
+  qa_pairs.py           # 访谈问答索引（纯标准库，轮次合并 + 保序一对一配对 DP）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -1195,6 +1319,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_playback_plan.py
   test_crosstalk_report.py
   test_transcript_retime.py
+  test_qa_pairs.py
   test_differential.py
   test_api.py
 Dockerfile
