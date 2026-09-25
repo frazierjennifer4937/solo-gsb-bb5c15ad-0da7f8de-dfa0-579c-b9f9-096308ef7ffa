@@ -347,3 +347,39 @@ class TranscriptRetimeResponse(BaseModel):
     matched_count: int = Field(
         ..., description="保序匹配命中的词对数（未匹配词数为修订总数减去该值）"
     )
+
+
+class QaPairsRequest(BaseModel):
+    words: list[WordIn] = Field(
+        ...,
+        min_length=1,
+        max_length=300,
+        description="按时间排列的词序列（至多 300 词）",
+    )
+    max_gap_ms: int = Field(
+        ..., ge=0, description="回答起点与问题终点的最大间隔（毫秒，非负整数）"
+    )
+
+
+class QaTurnOut(BaseModel):
+    start_word: int = Field(..., description="轮次首词序号（0-based，含）")
+    end_word: int = Field(..., description="轮次末词序号（0-based，含）")
+    start_ms: int
+    end_ms: int
+    speaker: str
+    text: str = Field(..., description="轮次文本：词文本原样拼接，不插空格")
+
+
+class QaPairOut(BaseModel):
+    index: int
+    question: QaTurnOut = Field(..., description="提问轮次")
+    answer: QaTurnOut = Field(..., description="回答轮次")
+
+
+class QaPairsResponse(BaseModel):
+    pairs: list[QaPairOut] = Field(
+        ..., description="按时间升序的问答对；无候选时为空数组"
+    )
+    unpaired_question_start_words: list[int] = Field(
+        ..., description="未配对提问的首词序号（0-based，升序）"
+    )
